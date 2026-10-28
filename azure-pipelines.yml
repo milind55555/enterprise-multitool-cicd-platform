@@ -1,0 +1,68 @@
+trigger:
+  branches:
+    include: [main]
+pr:
+  branches:
+    include: [main]
+
+variables:
+  vmImage: ubuntu-latest
+  imageTag: $(Build.SourceVersion)
+  # Define registryServiceConnection, containerRegistry, SONAR_* and Kubernetes service connection securely in project settings.
+
+stages:
+- stage: Verify
+  jobs:
+  - job: TestAndScan
+    pool:
+      vmImage: $(vmImage)
+    steps:
+    - task: JavaToolInstaller@0
+      inputs:
+        versionSpec: '17'
+        jdkArchitectureOption: x64
+        jdkSourceOption: PreInstalled
+    - script: cd app && mvn -B -ntp clean verify
+      displayName: Maven build and tests
+    - task: PublishTestResults@2
+      condition: succeededOrFailed()
+      inputs:
+        testResultsFormat: JUnit
+        testResultsFiles: 'app/target/surefire-reports/TEST-*.xml'
+    - script: |
+        docker build --pull -t enterprise-demo:$(imageTag) .
+        docker save enterprise-demo:$(imageTag) -o $(Build.ArtifactStagingDirectory)/image.tar
+      displayName: Build container image
+    - script: |
+        sudo apt-get update
+        sudo apt-get install -y wget
+        wget -qO- https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin
+        trivy fs --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed .
+        trivy image --input $(Build.ArtifactStagingDirectory)/image.tar --exit-code 1 --severity HIGH,CRITICAL --ignore-unfixed
+      displayName: Trivy scans
+    - publish: $(Build.ArtifactStagingDirectory)/image.tar
+      artifact: container-image
+
+- stage: Publish
+  dependsOn: Verify
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - job: PublishImage
+    pool:
+      vmImage: $(vmImage)
+    steps:
+    - download: current
+      artifact: container-image
+    - task: Docker@2
+      displayName: Login to container registry
+      inputs:
+        command: login
+        containerRegistry: $(registryServiceConnection)
+    - script: |
+        docker load -i "$(Pipeline.Workspace)/container-image/image.tar"
+        docker tag enterprise-demo:$(imageTag) $(containerRegistry)/enterprise-demo:$(imageTag)
+        docker push $(containerRegistry)/enterprise-demo:$(imageTag)
+      displayName: Publish immutable image
+
+# Add a separately protected deployment stage using a Kubernetes service connection and Helm.
+# Keep production approval checks in Azure DevOps Environments, not only in YAML.
